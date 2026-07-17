@@ -12,8 +12,8 @@ from pathlib import Path
 import logging
 
 from app.worker import download_video
-from app.queue import create_job, get_job, update_job_status, jobs
-from app.utils import validate_url, cleanup_old_files
+from app.queue import create_job, get_job, jobs
+from app.utils import is_valid_youtube_url, cleanup_old_files
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -50,15 +50,11 @@ async def health_check():
 @app.post("/request")
 async def create_download(request: DownloadRequest, background_tasks: BackgroundTasks):
     """Create a new download job"""
-    # Validate URL
-    if not validate_url(request.url):
+    if not is_valid_youtube_url(request.url):
         raise HTTPException(status_code=400, detail="Invalid YouTube URL")
     
-    # Create job
     job_id = str(uuid.uuid4())
     create_job(job_id, request.url, request.format)
-    
-    # Start audio URL extraction in background
     background_tasks.add_task(download_video, job_id, request.url, request.format)
     
     return {"job_id": job_id, "status": "queued"}
@@ -67,7 +63,6 @@ async def create_download(request: DownloadRequest, background_tasks: Background
 async def get_status(id: str):
     """Get job status"""
     job = get_job(id)
-    
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     
@@ -78,7 +73,6 @@ async def get_status(id: str):
         "filename": job.get("filename")
     }
     
-    # Include result data if available
     if job.get("result_data"):
         response["result"] = job.get("result_data")
     
@@ -88,7 +82,6 @@ async def get_status(id: str):
 async def get_result(id: str):
     """Get the result (audio URL)"""
     job = get_job(id)
-    
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     
@@ -98,23 +91,10 @@ async def get_result(id: str):
             content={"error": "not_ready", "status": job.get("status")}
         )
     
-    # Check if we have result data
     if job.get("result_data"):
         return JSONResponse(
             status_code=200,
             content=job.get("result_data")
         )
-    
-    # Fallback: try to read from file
-    filename = job.get("filename")
-    if filename and filename.endswith('.json'):
-        file_path = Path(__file__).parent / "downloads" / filename
-        if file_path.exists():
-            try:
-                with open(file_path, 'r') as f:
-                    data = json.load(f)
-                return JSONResponse(status_code=200, content=data)
-            except Exception as e:
-                logger.error(f"Error reading result file: {e}")
     
     raise HTTPException(status_code=404, detail="Result not found")
