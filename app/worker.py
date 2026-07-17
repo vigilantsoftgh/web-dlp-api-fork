@@ -1,25 +1,21 @@
+"""
+Background worker process for downloading videos using yt-dlp.
+"""
 import os
+import sys
 import time
-import json
 import subprocess
-import shutil
+import threading
+import json
 from pathlib import Path
-from queue import Queue
-from threading import Thread
 from datetime import datetime, timedelta
+from app.queue import update_job_status
+from app.utils import log_info, log_error
 import logging
 
-# Setup logging
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("web-dlp")
 
-# Configuration
-DOWNLOAD_DIR = Path("app/downloads")
-DOWNLOAD_DIR.mkdir(exist_ok=True)
-
-# Job queue
-job_queue = Queue()
-jobs = {}
+DOWNLOADS_DIR = Path(__file__).parent / "downloads"
 
 # Cookie setup
 def get_cookie_file():
@@ -28,7 +24,7 @@ def get_cookie_file():
         logger.warning("⚠️ No YOUTUBE_COOKIES environment variable found")
         return None
     
-    cookie_file = DOWNLOAD_DIR / "cookies.txt"
+    cookie_file = DOWNLOADS_DIR / "cookies.txt"
     try:
         # Convert to Netscape format
         cookie_pairs = [c.strip() for c in cookie_string.split(';') if c.strip()]
@@ -38,7 +34,6 @@ def get_cookie_file():
             for cookie in cookie_pairs:
                 if '=' in cookie:
                     name, value = cookie.split('=', 1)
-                    # Format: domain\tTRUE\tpath\tFALSE\texpiry\tname\tvalue
                     expiry = int(time.time()) + 31536000  # 1 year
                     f.write(f".youtube.com\tTRUE\t/\tFALSE\t{expiry}\t{name}\t{value}\n")
         logger.info("✅ Cookie file created successfully")
@@ -49,162 +44,149 @@ def get_cookie_file():
 
 COOKIE_FILE = get_cookie_file()
 
-def create_job(video_url, format_type):
-    """Create a new download job"""
-    job_id = f"{time.time_ns()}-{hash(video_url)}"
-    job = {
-        "id": job_id,
-        "url": video_url,
-        "format": format_type,
-        "status": "queued",
-        "progress": 0,
-        "error": None,
-        "created_at": datetime.now().isoformat(),
-        "file_path": None
-    }
-    jobs[job_id] = job
-    job_queue.put(job_id)
-    return job_id
 
-def get_job_status(job_id):
-    """Get job status"""
-    return jobs.get(job_id)
-
-def download_worker():
-    """Background worker process"""
-    logger.info("🧵 Worker started, waiting for jobs...")
+def download_video(job_id: str, url: str, format: str):
+    """
+    Download video or audio using yt-dlp.
     
-    while True:
-        try:
-            job_id = job_queue.get(timeout=5)
-            job = jobs.get(job_id)
+    Args:
+        job_id: Unique job identifier
+        url: YouTube video URL
+        format: Output format (mp3 or mp4)
+    """
+    try:
+        logger.info(f"Starting download for job {job_id}: {url} ({format})")
+        update_job_status(job_id, status='processing', progress=10)
+        
+        # Ensure downloads directory exists
+        DOWNLOADS_DIR.mkdir(exist_ok=True)
+        
+        # Determine output filename
+        if format == 'mp3':
+            output_filename = f"{job_id}.mp3"
+            output_path = DOWNLOADS_DIR / output_filename
             
-            if not job:
-                continue
-                
-            logger.info(f"📥 Processing job {job_id}: {job['url']}")
-            job["status"] = "processing"
-            job["progress"] = 10
-            
-            # Build yt-dlp command
+            # yt-dlp command for audio extraction
             cmd = [
-                "yt-dlp",
-                "--no-playlist",
-                "--no-warnings",
-                "--progress",
-                "--newline",
-                "--format", "bestaudio",
-                "--extract-audio",
-                "--audio-format", job["format"],
-                "--audio-quality", "0",
-                "-o", f"{DOWNLOAD_DIR}/{job_id}.%(ext)s",
-                job["url"]
+                'yt-dlp',
+                '--extract-audio',
+                '--audio-format', 'mp3',
+                '--audio-quality', '192K',
+                '--output', str(output_path),
+                '--no-playlist',
+                '--quiet',
+                '--no-warnings',
             ]
             
             # Add cookies if available
             if COOKIE_FILE:
-                cmd.extend(["--cookies", COOKIE_FILE])
-                logger.info("🍪 Using cookies for this job")
+                cmd.extend(['--cookies', COOKIE_FILE])
+                logger.info("🍪 Using cookies for audio extraction")
             
             # Add headers to mimic browser
             cmd.extend([
-                "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-                "--add-header", "Accept: audio/mp4,audio/*;q=0.9,*/*;q=0.8",
-                "--add-header", "Accept-Language: en-US,en;q=0.9",
-                "--add-header", "Origin: https://www.youtube.com",
-                "--add-header", "Referer: https://www.youtube.com"
+                '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+                '--add-header', 'Accept: audio/mp4,audio/*;q=0.9,*/*;q=0.8',
+                '--add-header', 'Accept-Language: en-US,en;q=0.9',
+                '--add-header', 'Origin: https://www.youtube.com',
+                '--add-header', 'Referer: https://www.youtube.com',
+                '--add-header', 'Sec-Fetch-Mode: navigate',
+                '--add-header', 'Sec-Fetch-Site: none',
+                '--add-header', 'Sec-Fetch-User: ?1',
             ])
             
-            job["progress"] = 30
-            job["status"] = "processing"
+            cmd.append(url)
             
-            # Run yt-dlp
-            process = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                cwd="."
+        else:  # mp4
+            output_filename = f"{job_id}.mp4"
+            output_path = DOWNLOADS_DIR / output_filename
+            
+            # yt-dlp command for video download (720p or best)
+            cmd = [
+                'yt-dlp',
+                '--format', 'bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best',
+                '--merge-output-format', 'mp4',
+                '--output', str(output_path),
+                '--no-playlist',
+                '--quiet',
+                '--no-warnings',
+            ]
+            
+            # Add cookies if available
+            if COOKIE_FILE:
+                cmd.extend(['--cookies', COOKIE_FILE])
+                logger.info("🍪 Using cookies for video extraction")
+            
+            # Add headers to mimic browser
+            cmd.extend([
+                '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+                '--add-header', 'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                '--add-header', 'Accept-Language: en-US,en;q=0.9',
+                '--add-header', 'Origin: https://www.youtube.com',
+                '--add-header', 'Referer: https://www.youtube.com',
+                '--add-header', 'Sec-Fetch-Mode: navigate',
+                '--add-header', 'Sec-Fetch-Site: none',
+                '--add-header', 'Sec-Fetch-User: ?1',
+            ])
+            
+            cmd.append(url)
+        
+        update_job_status(job_id, status='processing', progress=30)
+        logger.info(f"📋 Running command: {' '.join(cmd)}")
+        
+        # Execute yt-dlp
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        
+        if result.returncode != 0:
+            error_msg = result.stderr or "Download failed"
+            logger.error(f"❌ Job {job_id} failed: {error_msg}")
+            update_job_status(
+                job_id,
+                status='error',
+                error=error_msg,
+                progress=0
             )
-            
-            job["progress"] = 60
-            
-            stdout, stderr = process.communicate(timeout=180)  # 3 minute timeout
-            
-            if process.returncode != 0:
-                error_msg = stderr.strip() or stdout.strip() or "Unknown error"
-                job["status"] = "error"
-                job["error"] = error_msg
-                logger.error(f"❌ Job {job_id} failed: {error_msg}")
-                job["progress"] = 0
-                continue
-            
-            # Find the downloaded file
-            downloaded_files = list(DOWNLOAD_DIR.glob(f"{job_id}.*"))
-            if not downloaded_files:
-                job["status"] = "error"
-                job["error"] = "No file downloaded"
-                logger.error(f"❌ Job {job_id} failed: No file found")
-                job["progress"] = 0
-                continue
-            
-            # Rename to .mp3 if needed
-            if job["format"] == "mp3":
-                for f in downloaded_files:
-                    if f.suffix.lower() in ['.webm', '.m4a', '.aac']:
-                        new_name = f.with_suffix('.mp3')
-                        f.rename(new_name)
-                        downloaded_files = [new_name]
-                        break
-            
-            job["file_path"] = str(downloaded_files[0])
-            job["status"] = "finished"
-            job["progress"] = 100
-            logger.info(f"✅ Job {job_id} completed: {downloaded_files[0].name}")
-            
-        except Queue.Empty:
-            continue
-        except Exception as e:
-            logger.error(f"❌ Worker error: {e}")
-            if job_id and job_id in jobs:
-                jobs[job_id]["status"] = "error"
-                jobs[job_id]["error"] = str(e)
-                jobs[job_id]["progress"] = 0
+            return
+        
+        update_job_status(job_id, status='processing', progress=90)
+        
+        # Verify file exists
+        if not output_path.exists():
+            logger.error(f"❌ Job {job_id}: File not found after download")
+            update_job_status(
+                job_id,
+                status='error',
+                error='File not created',
+                progress=0
+            )
+            return
+        
+        # Mark as finished
+        update_job_status(
+            job_id,
+            status='finished',
+            progress=100,
+            filename=output_filename
+        )
+        logger.info(f"✅ Job {job_id} completed successfully: {output_filename}")
+        
+    except subprocess.TimeoutExpired:
+        logger.error(f"⏰ Job {job_id} timed out")
+        update_job_status(
+            job_id,
+            status='error',
+            error='Download timeout (5 minutes)',
+            progress=0
+        )
+    except Exception as e:
+        logger.error(f"❌ Job {job_id} error: {str(e)}")
+        update_job_status(
+            job_id,
+            status='error',
+            error=str(e),
+            progress=0
+        )
 
-def serve_file(job_id):
-    """Serve the downloaded file"""
-    job = jobs.get(job_id)
-    if not job or job["status"] != "finished":
-        return None, "not_ready"
-    
-    file_path = job["file_path"]
-    if not file_path or not os.path.exists(file_path):
-        return None, "file_not_found"
-    
-    return file_path, "ready"
 
-# Cleanup old files
-def cleanup_worker():
-    """Periodically clean up old files"""
-    while True:
-        try:
-            time.sleep(300)  # Every 5 minutes
-            now = datetime.now()
-            for job_id, job in list(jobs.items()):
-                if job["status"] == "finished":
-                    created = datetime.fromisoformat(job["created_at"])
-                    if (now - created) > timedelta(minutes=10):
-                        if job["file_path"] and os.path.exists(job["file_path"]):
-                            os.remove(job["file_path"])
-                            logger.info(f"🗑️ Deleted old file: {job['file_path']}")
-                        del jobs[job_id]
-        except Exception as e:
-            logger.error(f"Cleanup error: {e}")
-
-# Start worker threads
-def start_workers():
-    worker_thread = Thread(target=download_worker, daemon=True)
-    worker_thread.start()
-    cleanup_thread = Thread(target=cleanup_worker, daemon=True)
-    cleanup_thread.start()
-    logger.info("✅ Worker threads started")
+# Keep the original import structure
+# The download_video function is called directly by FastAPI BackgroundTasks.
