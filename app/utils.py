@@ -1,3 +1,4 @@
+# app/utils.py
 """
 Utility functions for validation, rate limiting, and logging.
 """
@@ -33,7 +34,11 @@ def is_valid_youtube_url(url: str) -> bool:
     youtube_patterns = [
         r'(https?://)?(www\.)?(youtube\.com|youtu\.be)/.+',
         r'(https?://)?(www\.)?youtube\.com/watch\?v=[\w-]+',
-        r'(https?://)?(www\.)?youtu\.be/[\w-]+'
+        r'(https?://)?(www\.)?youtu\.be/[\w-]+',
+        r'(https?://)?(www\.)?youtube\.com/shorts/[\w-]+',
+        r'(https?://)?(www\.)?youtube\.com/embed/[\w-]+',
+        r'(https?://)?(www\.)?youtube\.com/v/[\w-]+',
+        r'(https?://)?(www\.)?youtube\.com/playlist\?list=[\w-]+',
     ]
     
     for pattern in youtube_patterns:
@@ -41,6 +46,10 @@ def is_valid_youtube_url(url: str) -> bool:
             return True
     
     return False
+
+
+# Alias for main.py compatibility
+validate_url = is_valid_youtube_url
 
 
 def check_rate_limit(ip_address: str) -> bool:
@@ -81,6 +90,29 @@ def get_file_age(timestamp: float) -> float:
         Age in seconds
     """
     return time.time() - timestamp
+
+
+def cleanup_old_files(jobs, downloads_dir):
+    """Clean up old files (older than 10 minutes)"""
+    try:
+        current_time = time.time()
+        for job_id, job in list(jobs.items()):
+            if job.get('status') == 'finished':
+                filename = job.get('filename')
+                if filename:
+                    file_path = downloads_dir / filename
+                    if file_path.exists() and current_time - file_path.stat().st_mtime > 600:
+                        try:
+                            file_path.unlink()
+                            logger.info(f"🗑️ Deleted old file: {file_path.name}")
+                        except Exception as e:
+                            logger.warning(f"⚠️ Could not delete file: {e}")
+                
+                # Clean up expired jobs (older than 1 hour)
+                if current_time - job.get('created_at', 0) > 3600:
+                    del jobs[job_id]
+    except Exception as e:
+        logger.error(f"❌ Cleanup error: {e}")
 
 
 def log_info(message: str):
