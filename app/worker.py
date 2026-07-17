@@ -1,7 +1,4 @@
-"""
-Background worker process for extracting YouTube audio URL.
-No downloading - just returns the audio stream URL.
-"""
+# app/worker.py
 import os
 import sys
 import time
@@ -18,24 +15,18 @@ logger = logging.getLogger("web-dlp")
 def download_video(job_id: str, url: str, format: str):
     """
     Extract audio URL from YouTube without downloading.
-    
-    Args:
-        job_id: Unique job identifier
-        url: YouTube video URL
-        format: Output format (mp3 or mp4) - just used for metadata
     """
     try:
         log_info(f"🎵 Extracting audio URL for job {job_id}: {url}")
         update_job_status(job_id, status='processing', progress=10)
         
-        # ============ FIX: Just get the URL, don't download ============
-        # Use yt-dlp to get the audio URL without downloading
+        # Build yt-dlp command to get audio URL
         cmd = [
             'yt-dlp',
             '--no-playlist',
             '--no-warnings',
             '--quiet',
-            '--dump-json',  # Get JSON info
+            '--dump-json',
             '--format', 'bestaudio[ext=m4a]/bestaudio[acodec^=mp4a]/bestaudio[protocol^=http]/bestaudio',
             '--extractor-args', 'youtube:skip=hls,dash,livestream;player_client=web,android',
             '--sleep-interval', '2',
@@ -46,7 +37,6 @@ def download_video(job_id: str, url: str, format: str):
         # Add cookies if available
         cookie_string = os.environ.get('YOUTUBE_COOKIES')
         if cookie_string:
-            # Create cookies file
             cookie_file = Path(__file__).parent / "cookies.txt"
             try:
                 cookie_pairs = [c.strip() for c in cookie_string.split(';') if c.strip()]
@@ -74,7 +64,7 @@ def download_video(job_id: str, url: str, format: str):
         update_job_status(job_id, status='processing', progress=30)
         log_info(f"📋 Running: {' '.join(cmd)}")
         
-        # Execute yt-dlp and get JSON output
+        # Execute yt-dlp
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
         
         if result.returncode != 0:
@@ -88,7 +78,6 @@ def download_video(job_id: str, url: str, format: str):
             info = json.loads(result.stdout)
         except json.JSONDecodeError as e:
             log_error(f"❌ Failed to parse JSON: {e}")
-            log_error(f"Output: {result.stdout[:500]}")
             update_job_status(job_id, status='error', error='Invalid response from YouTube', progress=0)
             return
         
@@ -96,19 +85,17 @@ def download_video(job_id: str, url: str, format: str):
         audio_url = None
         audio_format = None
         
-        # Check for direct URL in info
+        # Check for direct URL
         if info.get('url'):
             audio_url = info['url']
             audio_format = info.get('ext', 'm4a')
         elif info.get('requested_downloads'):
-            # Check for audio-only formats
             for download in info['requested_downloads']:
                 if download.get('ext') in ['m4a', 'aac', 'mp3', 'opus']:
                     audio_url = download.get('url')
                     audio_format = download.get('ext', 'm4a')
                     break
         
-        # If still no URL, try to find in formats
         if not audio_url and info.get('formats'):
             for f in info['formats']:
                 if f.get('acodec') != 'none' and f.get('vcodec') == 'none':
@@ -117,41 +104,28 @@ def download_video(job_id: str, url: str, format: str):
                     break
         
         if not audio_url:
-            log_error(f"❌ No audio URL found in response")
+            log_error(f"❌ No audio URL found")
             update_job_status(job_id, status='error', error='No audio URL found', progress=0)
             return
         
         update_job_status(job_id, status='processing', progress=80)
         
-        # Get metadata
-        title = info.get('title', 'YouTube Audio')
-        author = info.get('channel', info.get('uploader', info.get('creator', 'YouTube')))
-        duration = int(info.get('duration', 0))
-        thumbnail = info.get('thumbnail', f"https://i.ytimg.com/vi/{info.get('id', '')}/hqdefault.jpg")
-        video_id = info.get('id', '')
-        
-        # Create job result with just the URL
+        # Create result data
         result_data = {
             'url': audio_url,
             'format': audio_format,
-            'title': title,
-            'author': author,
-            'duration': duration,
-            'thumbnail': thumbnail,
-            'videoId': video_id,
-            'isStream': True  # Mark as streaming URL
+            'title': info.get('title', 'YouTube Audio'),
+            'author': info.get('channel', info.get('uploader', 'YouTube')),
+            'duration': int(info.get('duration', 0)),
+            'thumbnail': info.get('thumbnail', ''),
+            'videoId': info.get('id', ''),
+            'isStream': True
         }
-        
-        # Save the URL result instead of a file
-        result_file = Path(__file__).parent / "downloads" / f"{job_id}.json"
-        with open(result_file, 'w') as f:
-            json.dump(result_data, f)
         
         update_job_status(
             job_id,
             status='finished',
             progress=100,
-            filename=f"{job_id}.json",
             result_data=result_data
         )
         log_info(f"✅ Job {job_id} completed: Audio URL extracted")
