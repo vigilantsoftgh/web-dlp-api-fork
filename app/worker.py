@@ -14,13 +14,13 @@ logger = logging.getLogger("web-dlp")
 
 def download_video(job_id: str, url: str, format: str):
     """
-    Extract audio URL from YouTube without downloading.
+    Extract audio URL from YouTube using Innertube API.
     """
     try:
         log_info(f"🎵 Extracting audio URL for job {job_id}: {url}")
         update_job_status(job_id, status='processing', progress=10)
         
-        # Build yt-dlp command to get audio URL
+        # ============ FIX: Use Innertube API with multiple clients ============
         cmd = [
             'yt-dlp',
             '--no-playlist',
@@ -28,50 +28,48 @@ def download_video(job_id: str, url: str, format: str):
             '--quiet',
             '--dump-json',
             '--format', 'bestaudio[ext=m4a]/bestaudio[acodec^=mp4a]/bestaudio[protocol^=http]/bestaudio',
-            '--extractor-args', 'youtube:skip=hls,dash,livestream;player_client=web,android',
-            '--sleep-interval', '2',
-            '--retries', '5',
-            url
-        ]
-        
-        # Add cookies if available
-        cookie_string = os.environ.get('YOUTUBE_COOKIES')
-        if cookie_string:
-            cookie_file = Path(__file__).parent / "cookies.txt"
-            try:
-                cookie_pairs = [c.strip() for c in cookie_string.split(';') if c.strip()]
-                with open(cookie_file, 'w') as f:
-                    f.write("# Netscape HTTP Cookie File\n")
-                    for cookie in cookie_pairs:
-                        if '=' in cookie:
-                            name, value = cookie.split('=', 1)
-                            expiry = int(time.time()) + 31536000
-                            f.write(f".youtube.com\tTRUE\t/\tFALSE\t{expiry}\t{name}\t{value}\n")
-                cmd.extend(['--cookies', str(cookie_file)])
-                log_info("🍪 Using cookies")
-            except Exception as e:
-                log_error(f"⚠️ Cookie error: {e}")
-        
-        # Add headers
-        cmd.extend([
-            '--user-agent', 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15',
-            '--add-header', 'Accept: audio/mp4,audio/*;q=0.9,*/*;q=0.8',
+            '--extractor-args', 'youtube:player_client=android,web;skip=hls,dash,livestream;player_skip=webpage,configs',
+            '--sleep-interval', '5',
+            '--max-sleep-interval', '10',
+            '--retries', '10',
+            '--fragment-retries', '10',
+            '--extractor-retries', '10',
+            '--user-agent', 'Mozilla/5.0 (Linux; Android 13; SM-S908B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.0.0 Mobile Safari/537.36',
+            '--add-header', 'Accept: application/json, text/plain, */*',
             '--add-header', 'Accept-Language: en-US,en;q=0.9',
             '--add-header', 'Origin: https://www.youtube.com',
             '--add-header', 'Referer: https://www.youtube.com',
-        ])
+            url
+        ]
         
         update_job_status(job_id, status='processing', progress=30)
         log_info(f"📋 Running: {' '.join(cmd)}")
         
         # Execute yt-dlp
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
         
         if result.returncode != 0:
-            error_msg = result.stderr or "Failed to get audio URL"
-            log_error(f"❌ Job {job_id} failed: {error_msg}")
-            update_job_status(job_id, status='error', error=error_msg, progress=0)
-            return
+            # Try alternative approach without format selector
+            log_info("🔄 Retrying with alternative format...")
+            alt_cmd = [
+                'yt-dlp',
+                '--no-playlist',
+                '--no-warnings',
+                '--quiet',
+                '--dump-json',
+                '--extractor-args', 'youtube:player_client=web;skip=hls,dash,livestream',
+                '--sleep-interval', '3',
+                '--retries', '5',
+                '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                url
+            ]
+            result = subprocess.run(alt_cmd, capture_output=True, text=True, timeout=120)
+            
+            if result.returncode != 0:
+                error_msg = result.stderr or "Failed to get audio URL"
+                log_error(f"❌ Job {job_id} failed: {error_msg}")
+                update_job_status(job_id, status='error', error=error_msg, progress=0)
+                return
         
         # Parse JSON output
         try:
@@ -81,21 +79,24 @@ def download_video(job_id: str, url: str, format: str):
             update_job_status(job_id, status='error', error='Invalid response from YouTube', progress=0)
             return
         
-        # Extract audio URL
+        # Extract audio URL - try different methods
         audio_url = None
         audio_format = None
         
-        # Check for direct URL
+        # Method 1: Check direct URL
         if info.get('url'):
             audio_url = info['url']
             audio_format = info.get('ext', 'm4a')
-        elif info.get('requested_downloads'):
+        
+        # Method 2: Check requested_downloads
+        if not audio_url and info.get('requested_downloads'):
             for download in info['requested_downloads']:
                 if download.get('ext') in ['m4a', 'aac', 'mp3', 'opus']:
                     audio_url = download.get('url')
                     audio_format = download.get('ext', 'm4a')
                     break
         
+        # Method 3: Check formats
         if not audio_url and info.get('formats'):
             for f in info['formats']:
                 if f.get('acodec') != 'none' and f.get('vcodec') == 'none':
@@ -103,8 +104,17 @@ def download_video(job_id: str, url: str, format: str):
                     audio_format = f.get('ext', 'm4a')
                     break
         
+        # Method 4: Try to get any URL
+        if not audio_url and info.get('formats'):
+            for f in info['formats']:
+                if f.get('url'):
+                    audio_url = f.get('url')
+                    audio_format = f.get('ext', 'm4a')
+                    break
+        
         if not audio_url:
             log_error(f"❌ No audio URL found")
+            log_error(f"Response keys: {list(info.keys())}")
             update_job_status(job_id, status='error', error='No audio URL found', progress=0)
             return
         
