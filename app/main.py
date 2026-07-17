@@ -1,18 +1,19 @@
 # app/main.py
 from fastapi import FastAPI, HTTPException, BackgroundTasks
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional
 import os
 import time
 import uuid
+import json
 from pathlib import Path
 import logging
 
 from app.worker import download_video
 from app.queue import create_job, get_job, update_job_status, jobs
-from app.utils import validate_url, rate_limit, cleanup_old_files
+from app.utils import validate_url, cleanup_old_files
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -40,7 +41,7 @@ threading.Thread(target=cleanup_thread, daemon=True).start()
 
 class DownloadRequest(BaseModel):
     url: str
-    format: Optional[str] = "mp3"  # Keep for compatibility
+    format: Optional[str] = "mp3"
 
 @app.get("/")
 async def health_check():
@@ -53,12 +54,12 @@ async def create_download(request: DownloadRequest, background_tasks: Background
     if not validate_url(request.url):
         raise HTTPException(status_code=400, detail="Invalid YouTube URL")
     
-    # Create job (always use m4a for iOS)
+    # Create job
     job_id = str(uuid.uuid4())
-    create_job(job_id, request.url, "m4a")  # Force m4a
+    create_job(job_id, request.url, request.format)
     
-    # Start download in background
-    background_tasks.add_task(download_video, job_id, request.url, "m4a")
+    # Start audio URL extraction in background
+    background_tasks.add_task(download_video, job_id, request.url, request.format)
     
     return {"job_id": job_id, "status": "queued"}
 
@@ -70,16 +71,22 @@ async def get_status(id: str):
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     
-    return {
+    response = {
         "status": job.get("status"),
         "progress": job.get("progress", 0),
         "error": job.get("error"),
         "filename": job.get("filename")
     }
+    
+    # Include result data if available
+    if job.get("result_data"):
+        response["result"] = job.get("result_data")
+    
+    return response
 
 @app.get("/result")
-async def download_result(id: str):
-    """Download the result file"""
+async def get_result(id: str):
+    """Get the result (audio URL)"""
     job = get_job(id)
     
     if not job:
@@ -91,32 +98,23 @@ async def download_result(id: str):
             content={"error": "not_ready", "status": job.get("status")}
         )
     
+    # Check if we have result data
+    if job.get("result_data"):
+        return JSONResponse(
+            status_code=200,
+            content=job.get("result_data")
+        )
+    
+    # Fallback: try to read from file
     filename = job.get("filename")
-    if not filename:
-        raise HTTPException(status_code=404, detail="File not found")
+    if filename and filename.endswith('.json'):
+        file_path = Path(__file__).parent / "downloads" / filename
+        if file_path.exists():
+            try:
+                with open(file_path, 'r') as f:
+                    data = json.load(f)
+                return JSONResponse(status_code=200, content=data)
+            except Exception as e:
+                logger.error(f"Error reading result file: {e}")
     
-    file_path = Path(__file__).parent / "downloads" / filename
-    
-    if not file_path.exists():
-        raise HTTPException(status_code=404, detail="File not found")
-    
-    # ============ FIX: Set correct MIME type for M4A ============
-    if filename.endswith(".m4a") or filename.endswith(".aac"):
-        media_type = "audio/mp4"
-    elif filename.endswith(".mp3"):
-        media_type = "audio/mpeg"
-    else:
-        media_type = "application/octet-stream"
-    
-    # ============ FIX: Add proper headers for iOS ============
-    return FileResponse(
-        file_path,
-        media_type=media_type,
-        filename=filename,
-        headers={
-            "Content-Type": media_type,
-            "Accept-Ranges": "bytes",
-            "Cache-Control": "no-cache",
-            "Content-Disposition": f'inline; filename="{filename}"',
-        }
-    )
+    raise HTTPException(status_code=404, detail="Result not found")
