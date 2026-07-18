@@ -1,7 +1,4 @@
 # app/utils.py
-"""
-Utility functions for validation, rate limiting, and logging.
-"""
 import re
 import time
 from collections import defaultdict
@@ -15,22 +12,14 @@ logging.basicConfig(
 )
 logger = logging.getLogger('web-dlp')
 
-# Rate limiting storage (IP -> list of timestamps)
+# Rate limiting - increased limits
 rate_limit_storage: Dict[str, list] = defaultdict(list)
 RATE_LIMIT_WINDOW = 60  # 1 minute
-RATE_LIMIT_MAX = 5  # 5 requests per minute
+RATE_LIMIT_MAX = 20  # Increased from 5 to 20 requests per minute
 
 
 def is_valid_youtube_url(url: str) -> bool:
-    """
-    Validate if the URL is a valid YouTube URL.
-    
-    Args:
-        url: URL to validate
-    
-    Returns:
-        True if valid YouTube URL, False otherwise
-    """
+    """Validate if the URL is a valid YouTube URL."""
     youtube_patterns = [
         r'(https?://)?(www\.)?(youtube\.com|youtu\.be)/.+',
         r'(https?://)?(www\.)?youtube\.com/watch\?v=[\w-]+',
@@ -48,20 +37,12 @@ def is_valid_youtube_url(url: str) -> bool:
     return False
 
 
-# Alias for main.py compatibility
+# Alias for compatibility
 validate_url = is_valid_youtube_url
 
 
 def check_rate_limit(ip_address: str) -> bool:
-    """
-    Check if the IP has exceeded the rate limit.
-    
-    Args:
-        ip_address: Client IP address
-    
-    Returns:
-        True if within limits, False if exceeded
-    """
+    """Check if the IP has exceeded the rate limit."""
     current_time = time.time()
     
     # Clean old entries
@@ -80,15 +61,7 @@ def check_rate_limit(ip_address: str) -> bool:
 
 
 def get_file_age(timestamp: float) -> float:
-    """
-    Calculate the age of a file in seconds.
-    
-    Args:
-        timestamp: File creation timestamp
-    
-    Returns:
-        Age in seconds
-    """
+    """Calculate the age of a file in seconds."""
     return time.time() - timestamp
 
 
