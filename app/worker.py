@@ -1,4 +1,4 @@
-# app/worker.py
+# app/worker.py - Updated to prioritize audio-only formats
 import os
 import sys
 import time
@@ -14,28 +14,28 @@ logger = logging.getLogger("web-dlp")
 
 def download_video(job_id: str, url: str, format: str):
     """
-    Extract audio URL from YouTube with fallback formats.
+    Extract audio URL from YouTube - prioritize audio-only formats.
     """
     try:
         log_info(f"🎵 Extracting audio URL for job {job_id}: {url}")
         update_job_status(job_id, status='processing', progress=10)
         
-        # ============ FIX: Try multiple format selectors ============
+        # ============ FIX: Prioritize audio-only formats ============
         format_selectors = [
-            # Try M4A first (best for iOS)
+            # Audio-only formats (best to worst)
             "bestaudio[ext=m4a]/bestaudio[acodec^=mp4a]/bestaudio",
-            # Try any audio format
+            "bestaudio[ext=webm]/bestaudio[acodec^=opus]/bestaudio",
+            "bestaudio[ext=aac]/bestaudio",
             "bestaudio",
-            # Fallback to any format (might be video with audio)
-            "best[acodec^=mp4a]/best",
-            # Last resort: any format
-            "best"
+            # Fallback to formats with audio (if no audio-only available)
+            "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
         ]
         
         audio_url = None
         audio_format = None
         info = None
         last_error = None
+        is_audio_only = False
         
         for fmt_selector in format_selectors:
             try:
@@ -49,7 +49,7 @@ def download_video(job_id: str, url: str, format: str):
                     '--dump-json',
                     '--format', fmt_selector,
                     '--extractor-args', 'youtube:player_client=web,android;skip=hls,dash,livestream;player_skip=webpage,configs',
-                    '--sleep-interval', '3',
+                    '--sleep-interval', '2',
                     '--retries', '5',
                     '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
                     '--add-header', 'Accept: audio/mp4,audio/*;q=0.9,*/*;q=0.8',
@@ -66,42 +66,68 @@ def download_video(job_id: str, url: str, format: str):
                     log_info(f"⚠️ Format {fmt_selector} failed, trying next...")
                     continue
                 
-                # Try to parse JSON
+                # Parse JSON
                 try:
                     info = json.loads(result.stdout)
                 except json.JSONDecodeError:
                     last_error = "Invalid JSON response"
                     continue
                 
-                # Extract URL from response
+                # Extract URL - prioritize audio-only
                 audio_url = None
+                audio_format = None
+                is_audio_only = False
                 
-                # Check direct URL
+                # Check if we got a direct URL
                 if info.get('url'):
                     audio_url = info['url']
-                    audio_format = info.get('ext', 'm4a')
+                    audio_format = info.get('ext', 'mp4')
+                    # Check if it's audio-only
+                    if info.get('acodec') != 'none' and info.get('vcodec') == 'none':
+                        is_audio_only = True
                     break
                 
                 # Check requested_downloads
                 if not audio_url and info.get('requested_downloads'):
                     for download in info['requested_downloads']:
                         if download.get('url'):
-                            audio_url = download.get('url')
-                            audio_format = download.get('ext', 'm4a')
-                            break
+                            # Check if this is audio-only
+                            if download.get('acodec') != 'none' and download.get('vcodec') == 'none':
+                                audio_url = download.get('url')
+                                audio_format = download.get('ext', 'm4a')
+                                is_audio_only = True
+                                break
+                            # If not audio-only, store as fallback
+                            if not audio_url:
+                                audio_url = download.get('url')
+                                audio_format = download.get('ext', 'mp4')
+                                is_audio_only = False
+                    
+                    if audio_url:
+                        break
                 
                 # Check formats
                 if not audio_url and info.get('formats'):
+                    # First try to find audio-only
                     for f in info['formats']:
-                        if f.get('url') and (f.get('acodec') != 'none' or f.get('vcodec') == 'none'):
+                        if f.get('url') and f.get('acodec') != 'none' and f.get('vcodec') == 'none':
                             audio_url = f.get('url')
                             audio_format = f.get('ext', 'm4a')
+                            is_audio_only = True
                             break
-                
-                if audio_url:
-                    log_info(f"✅ Found audio URL with format: {fmt_selector}")
-                    break
                     
+                    # If no audio-only, get any format with audio
+                    if not audio_url:
+                        for f in info['formats']:
+                            if f.get('url') and f.get('acodec') != 'none':
+                                audio_url = f.get('url')
+                                audio_format = f.get('ext', 'mp4')
+                                is_audio_only = False
+                                break
+                    
+                    if audio_url:
+                        break
+                
             except subprocess.TimeoutExpired:
                 last_error = "Timeout"
                 continue
@@ -125,7 +151,8 @@ def download_video(job_id: str, url: str, format: str):
             'duration': int(info.get('duration', 0)),
             'thumbnail': info.get('thumbnail', ''),
             'videoId': info.get('id', ''),
-            'isStream': True
+            'isStream': True,
+            'isAudioOnly': is_audio_only
         }
         
         update_job_status(
@@ -134,7 +161,7 @@ def download_video(job_id: str, url: str, format: str):
             progress=100,
             result_data=result_data
         )
-        log_info(f"✅ Job {job_id} completed: Audio URL extracted")
+        log_info(f"✅ Job {job_id} completed: {'Audio-only' if is_audio_only else 'Audio+Video'} URL extracted")
         
     except subprocess.TimeoutExpired:
         log_error(f"⏰ Job {job_id} timed out")
